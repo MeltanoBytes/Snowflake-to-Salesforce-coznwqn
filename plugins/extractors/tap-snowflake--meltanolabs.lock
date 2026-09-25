@@ -1,0 +1,296 @@
+{
+  "plugin_type": "extractors",
+  "name": "tap-snowflake",
+  "namespace": "tap_snowflake",
+  "variant": "meltanolabs",
+  "label": "Snowflake",
+  "repo": "https://github.com/MeltanoLabs/tap-snowflake",
+  "pip_url": "meltanolabs-tap-snowflake~=0.5.3",
+  "description": "Snowflake is a cloud data platform that provides a relational SQL data warehouse. Storage,\ncompute (a \"warehouse\") and cloud services scale independently, and an account runs on AWS,\nAzure or Google Cloud.\n\nThis tap reads tables and views from a Snowflake database through the [Snowflake SQLAlchemy\ndialect](https://docs.snowflake.com/en/developer-guide/python-connector/sqlalchemy). It runs\nevery query against the warehouse that you configure, so an extraction [consumes compute\ncredits](https://docs.snowflake.com/en/user-guide/cost-understanding-compute).\n\n## Streams\n\nStreams are discovered dynamically at runtime. Each table and view in the configured database\nbecomes a stream named `<schema>-<table>`; a column of that stream is selected as\n`<schema>-<table>.<column>`. The `information_schema` schema is excluded from discovery.\n\nDiscovery reflects every schema of the database, so a large account produces a large catalog.\nStep 5 below limits it to the objects that you need.\n\n## Setup\n\n### 1. Create a role and a user\n\nCreate a dedicated [role](https://docs.snowflake.com/en/user-guide/security-access-control-overview)\nand [user](https://docs.snowflake.com/en/sql-reference/sql/create-user) for the tap, then\n[grant](https://docs.snowflake.com/en/sql-reference/sql/grant-privilege) read access to the\nobjects that you extract. The role needs `USAGE` on the warehouse, on the database, and on each\nschema that discovery reads:\n\n```sql\nUSE ROLE ACCOUNTADMIN;\n\nCREATE ROLE tap_snowflake;\nCREATE USER tap_snowflake\n  PASSWORD = '<password>'\n  DEFAULT_ROLE = tap_snowflake\n  DEFAULT_WAREHOUSE = <warehouse>;\nGRANT ROLE tap_snowflake TO USER tap_snowflake;\n\nGRANT USAGE ON WAREHOUSE <warehouse> TO ROLE tap_snowflake;\nGRANT USAGE ON DATABASE <database> TO ROLE tap_snowflake;\nGRANT USAGE ON ALL SCHEMAS IN DATABASE <database> TO ROLE tap_snowflake;\nGRANT USAGE ON FUTURE SCHEMAS IN DATABASE <database> TO ROLE tap_snowflake;\nGRANT SELECT ON ALL TABLES IN DATABASE <database> TO ROLE tap_snowflake;\nGRANT SELECT ON FUTURE TABLES IN DATABASE <database> TO ROLE tap_snowflake;\nGRANT SELECT ON ALL VIEWS IN DATABASE <database> TO ROLE tap_snowflake;\nGRANT SELECT ON FUTURE VIEWS IN DATABASE <database> TO ROLE tap_snowflake;\n```\n\nThe [`FUTURE` grants](https://docs.snowflake.com/en/user-guide/security-access-control-configure#defining-future-grants-on-database-or-schema-objects)\ncover an object that someone creates after this point. Without them, a new table is discovered\nbut returns a permission error on extraction.\n\n### 2. Find your account identifier\n\nThe Account setting takes an account identifier, such as `myorg-account1`. See [Account\nIdentifiers](https://docs.snowflake.com/en/user-guide/admin-account-identifier). Do not include\nthe `.snowflakecomputing.com` suffix.\n\nA [network policy](https://docs.snowflake.com/en/user-guide/network-policies) on the account or\non the user restricts the addresses that may connect. Add the address that the pipeline runs\nfrom to the allowed list, or Snowflake rejects the connection before it authenticates.\n\n### 3. Choose an authentication method\n\nSet exactly one of Password, Private Key or Private Key Path. The tap stops with a\nconfiguration error when more than one of the three is set.\n\n**Password** \u2014 enter the password of the Snowflake user.\n\n**Key pair** \u2014 [key pair authentication](https://docs.snowflake.com/en/user-guide/key-pair-auth)\nreplaces the password with an RSA key. Follow [Configuring key pair authentication](https://docs.snowflake.com/en/user-guide/key-pair-auth#configuring-key-pair-authentication)\nto generate the key pair and to [assign the public key to the Snowflake user](https://docs.snowflake.com/en/user-guide/key-pair-auth#assign-the-public-key-to-a-snowflake-user).\n\nGive the private key to the tap in one of two ways. The Private Key setting holds the base64\nencoded contents of the private key file, which the platform decodes back to PEM before the tap\nreads it:\n\n```sh\nbase64 -w0 rsa_key.p8\n```\n\nPrivate Key Path points at a key file on disk instead, so it suits a self-hosted run rather\nthan a hosted pipeline, which has no persistent filesystem to hold the key. Set Private Key\nPassphrase as well when the key carries a passphrase.\n\n**Browser SSO** \u2014 Use Browser Authentication authenticates through your identity provider with\n[browser-based SSO](https://docs.snowflake.com/en/user-guide/admin-security-fed-auth-use#browser-based-sso),\nwhich opens an external browser. The prompt needs a person to answer it, so this option fits an\ninteractive local run only. It also takes precedence over the three credential settings above.\n\n### 4. Set the session context\n\nWarehouse, Database, Role and Schema set the initial context of the Snowflake session. Set\nWarehouse to the [warehouse](https://docs.snowflake.com/en/user-guide/warehouses-overview) that\nruns the queries, and Database to the database that holds the objects. Set Role when the user\nholds more than one role, because a query that runs under the wrong role sees a different set of\nobjects. Schema sets the initial schema only and does not restrict discovery.\n\n### 5. Limit discovery to the objects you need (optional)\n\nThe Tables setting limits discovery to the objects that you list, which keeps a large account\nfrom producing a catalog of every table and view. Fully qualify each entry as\n`<schema>.<table>`:\n\n```yml\ntables:\n- sales.orders\n- sales.customers\n```\n\nNote that the syntax differs from `select`, which separates the schema and the table with a\nhyphen. When you add a stream to `select`, add the same object to Tables as well, or discovery\nwill not produce it.\n\n### 6. Replicate incrementally (optional)\n\nA stream is replicated in full on each run. To replicate a stream incrementally, set a\nreplication key for it under `metadata` in your `meltano.yml`:\n\n```yml\nplugins:\n  extractors:\n  - name: tap-snowflake\n    variant: meltanolabs\n    pip_url: meltanolabs-tap-snowflake~=0.5.3\n    metadata:\n      <schema>-<table>:\n        replication-method: INCREMENTAL\n        replication-key: <column>\n        key-properties: [<column>]\n```\n\nUse a replication key that never decreases, such as an updated timestamp or an ascending key.\nThe tap resumes with `where <replication-key> >= <bookmark>`, so the rows that sit on the\nbookmark are sent again on the next run. Set `key-properties` as well, so that the target\nreplaces those rows instead of duplicating them. Snowflake does not enforce a primary key\nconstraint, so discovery finds no key properties for a stream and cannot supply them itself.\n\n### 7. Preserve numeric precision (optional)\n\nSet Use Singer Decimal to emit a `NUMBER` column as a string with the `x-singer.decimal`\nformat. A [`NUMBER`](https://docs.snowflake.com/en/sql-reference/data-types-numeric) column\nholds up to 38 digits of precision, which a JSON number cannot carry without loss.\n\n### 8. Enable BATCH mode for large tables (optional)\n\nInstead of one record message per row, the tap can write files and emit batch messages, which a\ncompatible target loads in bulk. Set Batch Encoding Format and Batch Compression Format, plus\nBatch Storage Root and Batch Storage Prefix for the location of the files.\n\nSet Batch Encoding Format to Arrow to fetch query results directly in Arrow format from\nSnowflake (via the Snowflake driver's native Arrow result support) and write them to Arrow IPC\nfiles, with no intermediate stage unload/download or JSON round trip. JSONL instead unloads\nrows to the Snowflake-managed internal user stage with `COPY INTO`, then downloads them \u2014 set\nBatch Compression Format for that path only; Arrow ignores it.\n\n> **Caveats** \u2014 batch messages do not support `INCREMENTAL` replication in this variant, so a\n> stream in BATCH mode is replicated in full, for both Arrow and JSONL. Only a target that\n> advertises the `batch` capability processes the messages; leave these settings unset for any\n> other target.\n",
+  "logo_url": "/assets/logos/extractors/snowflake.png",
+  "capabilities": [
+    "about",
+    "batch",
+    "structured-logging",
+    "catalog",
+    "activate-version",
+    "discover",
+    "state",
+    "schema-flattening",
+    "stream-maps"
+  ],
+  "settings": [
+    {
+      "name": "account",
+      "kind": "string",
+      "label": "Account",
+      "description": "Your account identifier. See [Account Identifiers](https://docs.snowflake.com/en/user-guide/admin-account-identifier.html).",
+      "hidden": false,
+      "sensitive": false,
+      "configured": false,
+      "protected": false
+    },
+    {
+      "name": "database",
+      "kind": "string",
+      "label": "Database",
+      "description": "The initial database for the Snowflake session.",
+      "hidden": false,
+      "sensitive": false,
+      "configured": false,
+      "protected": false
+    },
+    {
+      "name": "faker_config.locale",
+      "kind": "array",
+      "label": "Faker Locale",
+      "description": "One or more LCID locale strings to produce localized output for: https://faker.readthedocs.io/en/master/#localization",
+      "hidden": false,
+      "sensitive": false,
+      "configured": false,
+      "protected": false
+    },
+    {
+      "name": "faker_config.seed",
+      "kind": "string",
+      "label": "Faker Seed",
+      "description": "Value to seed the Faker generator for deterministic output: https://faker.readthedocs.io/en/master/#seeding-the-generator",
+      "hidden": false,
+      "sensitive": false,
+      "configured": false,
+      "protected": false
+    },
+    {
+      "name": "flattening_enabled",
+      "kind": "boolean",
+      "label": "Enable Schema Flattening",
+      "description": "'True' to enable schema flattening and automatically expand nested properties.",
+      "hidden": false,
+      "sensitive": false,
+      "configured": false,
+      "protected": false
+    },
+    {
+      "name": "flattening_max_depth",
+      "kind": "integer",
+      "label": "Max Flattening Depth",
+      "description": "The max depth to flatten schemas.",
+      "hidden": false,
+      "sensitive": false,
+      "configured": false,
+      "protected": false
+    },
+    {
+      "name": "flattening_max_key_length",
+      "kind": "integer",
+      "label": "Max Key Length",
+      "description": "The maximum length of a flattened key.",
+      "hidden": false,
+      "sensitive": false,
+      "configured": false,
+      "protected": false
+    },
+    {
+      "name": "password",
+      "kind": "string",
+      "label": "Password",
+      "description": "The password for your Snowflake user. One of [`password`, `private_key`, `private_key_path`] is required.",
+      "hidden": false,
+      "sensitive": true,
+      "configured": false,
+      "protected": false
+    },
+    {
+      "name": "private_key",
+      "kind": "string",
+      "label": "Private Key",
+      "description": "Base64 encoded private key contents for KeyPair authentication. One of [`password`, `private_key`, `private_key_path`] is required.",
+      "hidden": false,
+      "sensitive": true,
+      "encoding": "base64",
+      "configured": false,
+      "protected": false
+    },
+    {
+      "name": "private_key_passphrase",
+      "kind": "string",
+      "label": "Private Key Passphrase",
+      "description": "The passprhase used to protect the private key",
+      "hidden": false,
+      "sensitive": true,
+      "configured": false,
+      "protected": false
+    },
+    {
+      "name": "private_key_path",
+      "kind": "string",
+      "label": "Private Key Path",
+      "description": "Path to where the private key is stored. The private key is used to connect to snowflake. One of [`password`, `private_key`, `private_key_path`] is required.",
+      "hidden": false,
+      "sensitive": true,
+      "configured": false,
+      "protected": false
+    },
+    {
+      "name": "role",
+      "kind": "string",
+      "label": "Role",
+      "description": "The initial role for the session.",
+      "hidden": false,
+      "sensitive": false,
+      "configured": false,
+      "protected": false
+    },
+    {
+      "name": "schema",
+      "kind": "string",
+      "label": "Schema",
+      "description": "The initial schema for the Snowflake session.",
+      "hidden": false,
+      "sensitive": false,
+      "configured": false,
+      "protected": false
+    },
+    {
+      "name": "stream_map_config",
+      "kind": "object",
+      "label": "User Stream Map Configuration",
+      "description": "User-defined config values to be used within map expressions.",
+      "hidden": false,
+      "sensitive": false,
+      "configured": false,
+      "protected": false
+    },
+    {
+      "name": "stream_maps",
+      "kind": "object",
+      "label": "Stream Maps",
+      "description": "Config object for stream maps capability. For more information check out [Stream Maps](https://sdk.meltano.com/en/latest/stream_maps.html).",
+      "hidden": false,
+      "sensitive": false,
+      "configured": false,
+      "protected": false
+    },
+    {
+      "name": "tables",
+      "kind": "array",
+      "label": "Tables",
+      "description": "An array of the table names that you want to sync. The table names should be fully qualified, including schema and table name. NOTE: this limits discovery to the tables specified, for performance reasons. Do not specify `tables` if you intend to discover the entire available catalog. See readme for more details on the tables configuration parameter.",
+      "hidden": false,
+      "sensitive": false,
+      "configured": false,
+      "protected": false
+    },
+    {
+      "name": "use_browser_authentication",
+      "kind": "boolean",
+      "value": false,
+      "label": "Use Browser Authentication",
+      "description": "If authentication should be done using SSO (via external browser). See SSO browser authentication.",
+      "hidden": false,
+      "sensitive": false,
+      "configured": false,
+      "protected": false
+    },
+    {
+      "name": "use_singer_decimal",
+      "kind": "boolean",
+      "label": "Use Singer Decimal",
+      "description": "Whether to use use strings with `x-singer.decimal` format for decimals in the discovered schema. This is useful to avoid precision loss when working with large numbers.",
+      "hidden": false,
+      "sensitive": false,
+      "configured": false,
+      "protected": false
+    },
+    {
+      "name": "user",
+      "kind": "string",
+      "label": "User",
+      "description": "The login name for your Snowflake user.",
+      "hidden": false,
+      "sensitive": false,
+      "configured": false,
+      "protected": false
+    },
+    {
+      "name": "warehouse",
+      "kind": "string",
+      "label": "Warehouse",
+      "description": "The initial warehouse for the session.",
+      "hidden": false,
+      "sensitive": false,
+      "configured": false,
+      "protected": false
+    },
+    {
+      "name": "batch_config.encoding.format",
+      "kind": "options",
+      "label": "Batch Encoding Format",
+      "description": "Format to use for batch files.",
+      "options": [
+        {
+          "label": "JSONL",
+          "value": "jsonl"
+        },
+        {
+          "label": "Arrow",
+          "value": "arrow"
+        }
+      ],
+      "hidden": false,
+      "sensitive": false,
+      "configured": false,
+      "protected": false
+    },
+    {
+      "name": "batch_config.encoding.compression",
+      "kind": "options",
+      "label": "Batch Compression Format",
+      "description": "Compression format to use for batch files.",
+      "options": [
+        {
+          "label": "GZIP",
+          "value": "gzip"
+        },
+        {
+          "label": "None",
+          "value": "none"
+        }
+      ],
+      "hidden": true,
+      "sensitive": false,
+      "configured": false,
+      "protected": false
+    },
+    {
+      "name": "batch_config.storage.root",
+      "kind": "string",
+      "label": "Batch Storage Root",
+      "description": "Root path to use when writing batch files. This tap does not default it the way tap-mysql does, so `file://` is set here as a stop-gap until that's fixed upstream in MeltanoLabs/tap-snowflake or the Meltano SDK.",
+      "hidden": true,
+      "sensitive": false,
+      "configured": false,
+      "protected": false
+    },
+    {
+      "name": "batch_config.storage.prefix",
+      "kind": "string",
+      "label": "Batch Storage Prefix",
+      "description": "Prefix to use when writing batch files. This tap does not default it the way tap-mysql does, so `batch_files` is set here as a stop-gap until that's fixed upstream in MeltanoLabs/tap-snowflake or the Meltano SDK.",
+      "hidden": true,
+      "sensitive": false,
+      "configured": false,
+      "protected": false
+    },
+    {
+      "name": "batch_config.batch_size",
+      "kind": "integer",
+      "label": "Batch Size",
+      "description": "Max number of rows per batch file. This tap has no default of its own, so it falls back to the Meltano SDK's default of 10000, which tap-mysql overrides on its own side; `500000` is set here to match that.",
+      "hidden": false,
+      "sensitive": false,
+      "configured": false,
+      "protected": false
+    }
+  ]
+}
